@@ -1,0 +1,505 @@
+#!/usr/bin/env python3
+"""
+Multicast PCAP Analyzer — FastAPI single-file app
+
+What it does
+- Web upload of .pcap/.pcapng, analyzed on-box with scapy (no tshark required)
+- Detects IGMP (queries/reports/leaves), multicast groups & per-stream stats
+- Per-stream bitrate, packets-per-second, interarrival jitter
+- RTP v2 heuristic with packet-loss % per SSRC
+- Flags noisy discovery (mDNS/SSDP), TTL pitfalls, very high-bitrate streams
+- Lists VLAN IDs (802.1Q) observed on multicast frames
+
+Run locally
+  python -m venv .venv && source .venv/bin/activate  # Windows: .venv\\Scripts\\activate
+  pip install -r requirements.txt  # or: pip install fastapi uvicorn scapy jinja2
+  uvicorn app:app --host 0.0.0.0 --port 8000
+  # open http://127.0.0.1:8000
+
+Security/ops
+- Max upload handled by explicit size check. Adjust MAX_CONTENT_LENGTH.
+- Files are stored to a NamedTemporaryFile and removed after parsing.
+- For production, run behind a proper reverse proxy (nginx) and add auth.
+"""
+
+from fastapi import FastAPI, UploadFile, File, Request
+from fastapi.responses import HTMLResponse, PlainTextResponse
+from fastapi.exceptions import RequestEntityTooLarge
+import uvicorn
+import os
+import tempfile
+import time
+from collections import defaultdict, Counter
+from statistics import pstdev
+import ipaddress
+from typing import Dict, Any, List, Tuple
+
+# scapy
+from scapy.all import (
+    PcapReader,
+    IP,
+    IPv6,
+    UDP,
+    TCP,
+    Raw,
+    IGMP,
+    Dot1Q,
+)
+
+APP_TITLE = "Multicast PCAP Analyzer (FastAPI)"
+UPLOAD_EXTENSIONS = {".pcap", ".pcapng"}
+MAX_CONTENT_LENGTH = 200 * 1024 * 1024  # 200 MB
+
+app = FastAPI(title=APP_TITLE)
+
+# -------------------------- Utils --------------------------
+
+def is_multicast_ip(ip_str: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(ip_str)
+        return ip.is_multicast
+    except ValueError:
+        return False
+
+
+def rtp_parse(payload: bytes):
+    """Best-effort RTP v2 detection."""
+    if len(payload) < 12:
+        return None
+    v_p_x_cc = payload[0]
+    version = (v_p_x_cc >> 6) & 0b11
+    if version != 2:
+        return None
+    pt = payload[1] & 0x7F
+    seq = int.from_bytes(payload[2:4], "big")
+    ts = int.from_bytes(payload[4:8], "big")
+    ssrc = int.from_bytes(payload[8:12], "big")
+    return {"pt": pt, "seq": seq, "ts": ts, "ssrc": ssrc}
+
+
+# -------------------------- Analyzer core --------------------------
+
+def analyze_pcap(file_path: str) -> Dict[str, Any]:
+    t0 = time.time()
+
+    first_ts = None
+    last_ts = None
+    total_packets = 0
+
+    igmp_types = Counter()
+    igmp_groups_reported = Counter()
+    igmp_groups_left = Counter()
+    igmp_queries = 0
+
+    groups_seen = Counter()
+    vlan_ids = Counter()
+
+    bytes_per_stream = Counter()  # (dst_ip, dport)
+    packets_per_stream = Counter()
+    interarrivals = defaultdict(list)
+    last_time_per_stream = {}
+
+    ttl_by_group = defaultdict(Counter)
+
+    rtp_streams = {}  # (dst_ip, dport, ssrc) => stats
+
+    mdns_count = 0
+    ssdp_count = 0
+
+    def update_time_bounds(ts: float):
+        nonlocal first_ts, last_ts
+        if first_ts is None or ts < first_ts:
+            first_ts = ts
+        if last_ts is None or ts > last_ts:
+            last_ts = ts
+
+    with PcapReader(file_path) as pcap:
+        for pkt in pcap:
+            total_packets += 1
+            ts = float(getattr(pkt, "time", 0.0))
+            update_time_bounds(ts)
+
+            # VLAN tags (handle QinQ by iterpayloads)
+            if Dot1Q in pkt:
+                for layer in pkt.iterpayloads():
+                    if isinstance(layer, Dot1Q):
+                        vlan_ids[layer.vlan] += 1
+                    else:
+                        break
+
+            # IGMP
+            if pkt.haslayer(IGMP):
+                ig = pkt[IGMP]
+                igmp_types[ig.type] += 1
+                if ig.type == 0x11:  # query
+                    igmp_queries += 1
+                elif ig.type in (0x16, 0x22):  # v2 report or v3 report
+                    gaddr = getattr(ig, "gaddr", None)
+                    if gaddr and is_multicast_ip(gaddr):
+                        igmp_groups_reported[gaddr] += 1
+                elif ig.type == 0x17:
+                    gaddr = getattr(ig, "gaddr", None)
+                    if gaddr and is_multicast_ip(gaddr):
+                        igmp_groups_left[gaddr] += 1
+
+            ip_layer = pkt.getlayer(IP) or pkt.getlayer(IPv6)
+            if not ip_layer:
+                continue
+
+            dst_ip = ip_layer.dst
+            src_ip = ip_layer.src
+
+            if is_multicast_ip(dst_ip):
+                groups_seen[dst_ip] += 1
+                ttl = getattr(ip_layer, "ttl", getattr(ip_layer, "hlim", None))
+                ttl_by_group[dst_ip][ttl] += 1
+
+                if UDP in pkt:
+                    udp = pkt[UDP]
+                    key = (dst_ip, int(udp.dport))
+                    plen = len(pkt)
+                    bytes_per_stream[key] += plen
+                    packets_per_stream[key] += 1
+
+                    if ts:
+                        last = last_time_per_stream.get(key)
+                        if last is not None:
+                            interarrivals[key].append(ts - last)
+                        last_time_per_stream[key] = ts
+
+                    raw = pkt.getlayer(Raw)
+                    if raw and raw.load:
+                        rtp = rtp_parse(bytes(raw.load))
+                        if rtp:
+                            rkey = (dst_ip, int(udp.dport), rtp["ssrc"])
+                            s = rtp_streams.get(rkey)
+                            if s is None:
+                                s = {
+                                    "packets": 0,
+                                    "bytes": 0,
+                                    "prev_seq": None,
+                                    "lost": 0,
+                                    "expected": 0,
+                                    "pt": rtp["pt"],
+                                }
+                                rtp_streams[rkey] = s
+                            s["packets"] += 1
+                            s["bytes"] += plen
+                            if s["prev_seq"] is not None:
+                                gap = (rtp["seq"] - s["prev_seq"]) & 0xFFFF
+                                if gap > 1:
+                                    s["lost"] += gap - 1
+                                s["expected"] += 1
+                            s["prev_seq"] = rtp["seq"]
+
+                if UDP in pkt:
+                    udp = pkt[UDP]
+                    if dst_ip == "224.0.0.251" and udp.dport == 5353:
+                        mdns_count += 1
+                    if dst_ip == "239.255.255.250" and udp.dport == 1900:
+                        ssdp_count += 1
+
+    duration = (last_ts - first_ts) if (first_ts is not None and last_ts is not None and last_ts > first_ts) else None
+
+    streams_summary: List[Dict[str, Any]] = []
+    for key in sorted(packets_per_stream.keys(), key=lambda k: (-packets_per_stream[k], k)):
+        dst_ip, dport = key
+        pkts = packets_per_stream[key]
+        bytes_total = bytes_per_stream[key]
+        pps = (pkts / duration) if duration else None
+        bps = (bytes_total * 8 / duration) if duration else None
+        ias = interarrivals.get(key, [])
+        jitter = (pstdev(ias) if len(ias) > 1 else 0.0) if duration else None
+        streams_summary.append({
+            "group": dst_ip,
+            "port": dport,
+            "packets": pkts,
+            "bytes": bytes_total,
+            "pps": pps,
+            "bps": bps,
+            "jitter": jitter,
+            "ttl_hist": dict(ttl_by_group[dst_ip]),
+        })
+
+    rtp_summary: List[Dict[str, Any]] = []
+    for (g, port, ssrc), s in rtp_streams.items():
+        loss_pct = (s["lost"] / (s["lost"] + s["packets"]) * 100.0) if (s["lost"] + s["packets"]) else 0.0
+        rtp_summary.append({
+            "group": g,
+            "port": port,
+            "ssrc": ssrc,
+            "packets": s["packets"],
+            "bytes": s["bytes"],
+            "pt": s["pt"],
+            "lost": s["lost"],
+            "loss_pct": loss_pct,
+        })
+
+    warnings: List[str] = []
+    if sum(igmp_groups_reported.values()) > 0 and igmp_queries == 0:
+        warnings.append("IGMP membership reports seen but no IGMP queries — network may be missing an active querier.")
+
+    if duration and mdns_count / duration > 200:
+        warnings.append("High mDNS traffic rate detected; consider isolating or rate‑limiting discovery protocols.")
+
+    if duration and ssdp_count / duration > 200:
+        warnings.append("High SSDP (UPnP) traffic rate detected; consider filtering 239.255.255.250:1900.")
+
+    ttl_one_groups = [g for g, hist in ttl_by_group.items() if sum(v for t, v in hist.items() if t == 1) > (sum(hist.values()) * 0.8)]
+    if ttl_one_groups:
+        warnings.append(
+            f"Many multicast packets with TTL=1 (groups: {', '.join(ttl_one_groups[:8])}{'…' if len(ttl_one_groups)>8 else ''}). If traffic must cross subnets, ensure sources set TTL>1."
+        )
+
+    heavy_streams = [s for s in streams_summary if s["bps"] and s["bps"] > 300e6]
+    if heavy_streams:
+        names = [f"{s['group']}:{s['port']} (~{s['bps']/1e6:.1f} Mbps)" for s in heavy_streams[:6]]
+        warnings.append("High‑bitrate multicast streams detected: " + ", ".join(names) + ". Verify IGMP snooping and uplinks.")
+
+    result = {
+        "summary": {
+            "total_packets": total_packets,
+            "duration_seconds": duration,
+            "first_timestamp": first_ts,
+            "last_timestamp": last_ts,
+        },
+        "igmp": {
+            "type_counts": dict(igmp_types),
+            "queries": igmp_queries,
+            "groups_reported": dict(igmp_groups_reported),
+            "groups_left": dict(igmp_groups_left),
+        },
+        "groups_seen": dict(groups_seen),
+        "streams": streams_summary,
+        "rtp": rtp_summary,
+        "vlan_ids": sorted(vlan_ids.items(), key=lambda kv: -kv[1]),
+        "mdns_packets": mdns_count,
+        "ssdp_packets": ssdp_count,
+        "warnings": warnings,
+        "elapsed_sec": time.time() - t0,
+    }
+    return result
+
+
+# -------------------------- HTML --------------------------
+
+BASE_CSS = """
+:root{--bg:#0b1020;--card:#121933;--ink:#e6e9ef;--muted:#aab2d5;--line:#22305d;--accent:#2a62ff}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+header{padding:20px;background:linear-gradient(135deg,#0f1629,#131a33);border-bottom:1px solid #1f2742;position:sticky;top:0;z-index:10}
+main{max-width:1100px;margin:0 auto;padding:20px}
+.card{background:var(--card);border:1px solid #1f2742;border-radius:16px;padding:18px;box-shadow:0 10px 30px rgba(0,0,0,.25);margin-bottom:20px}
+.btn{display:inline-block;padding:10px 14px;background:var(--accent);color:#fff;text-decoration:none;border-radius:10px;border:none;cursor:pointer;font-weight:600}
+input[type=file]{width:100%;padding:12px;background:#0b1020;color:var(--ink);border:1px dashed #2d3963;border-radius:12px}
+.muted{color:var(--muted)}
+table{width:100%;border-collapse:collapse;border-radius:12px;overflow:hidden}
+th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--line)}
+th{position:sticky;top:0;background:#172042}
+code,pre{background:#0b1020;padding:2px 6px;border-radius:6px}
+.pill{display:inline-block;padding:2px 8px;border-radius:999px;background:#21315f}
+.warn{background:#3b1d1f;border:1px solid #6a2b31;color:#f7c6c7;border-radius:12px;padding:12px}
+.footer{color:#8e96b8;font-size:12px;margin-top:18px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:12px}
+"""
+
+INDEX_HTML = f"""
+<!doctype html>
+<html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'>
+<title>{APP_TITLE}</title>
+<link rel=preconnect href=https://fonts.googleapis.com>
+<link rel=preconnect href=https://fonts.gstatic.com crossorigin>
+<link href='https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap' rel=stylesheet>
+<style>{BASE_CSS}</style>
+</head>
+<body>
+<header><h1 style='margin:0;font-size:20px'>{APP_TITLE}</h1></header>
+<main>
+  <div class=card>
+    <h2>Upload a PCAP/PCAPNG</h2>
+    <p class=muted>Max size: {MAX_CONTENT_LENGTH//(1024*1024)} MB. Files never leave this server; analysis runs locally with <code>scapy</code>.</p>
+    <form action='/analyze' method='post' enctype='multipart/form-data'>
+      <input type='file' name='pcap' accept='.pcap,.pcapng' required>
+      <p style='margin-top:12px'><button class=btn type='submit'>Analyze</button></p>
+    </form>
+    <details style='margin-top:12px'><summary>Install & run</summary>
+      <pre>python -m venv .venv
+source .venv/bin/activate  # Windows: .venv\Scripts\activate
+pip install fastapi uvicorn scapy jinja2
+uvicorn app:app --host 0.0.0.0 --port 8000</pre>
+    </details>
+  </div>
+  <div class=card>
+    <h3>What this checks</h3>
+    <ul>
+      <li>IGMP presence (queries / reports / leaves)</li>
+      <li>Observed multicast groups & ports</li>
+      <li>Per-stream bitrate (bps), packet rate (pps), jitter (stddev of interarrival)</li>
+      <li>RTP v2 loss % by SSRC (when detected)</li>
+      <li>TTL distributions (warn if TTL=1 dominates)</li>
+      <li>VLAN tags (802.1Q) on multicast packets</li>
+      <li>Chatty discovery (mDNS/SSDP)</li>
+    </ul>
+  </div>
+  <div class='footer muted'>Built with FastAPI • Need Docker or auth? Ask and I'll add it.</div>
+</main>
+</body></html>
+"""
+
+
+def _fmt_bytes(n: int) -> str:
+    for unit in ["B","KB","MB","GB"]:
+        if n < 1024 or unit == "GB":
+            return f"{n:.1f} {unit}" if unit != "B" else f"{n} B"
+        n /= 1024
+
+
+@app.get("/", response_class=HTMLResponse)
+async def index(_: Request):
+    return INDEX_HTML
+
+
+@app.post("/analyze", response_class=HTMLResponse)
+async def analyze(pcap: UploadFile = File(...)):
+    name = pcap.filename or "upload.pcap"
+    ext = os.path.splitext(name)[1].lower()
+    if ext not in UPLOAD_EXTENSIONS:
+        return HTMLResponse(f"<h3>Unsupported file type: {ext}</h3>", status_code=400)
+
+    # Read with a size cap
+    data = await pcap.read()
+    if len(data) > MAX_CONTENT_LENGTH:
+        return HTMLResponse(
+            f"<h3>File too large</h3><p>Max allowed: {MAX_CONTENT_LENGTH//(1024*1024)} MB</p>",
+            status_code=413,
+        )
+
+    # Write to a temp file so scapy can stream-parse
+    with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
+        tmp.write(data)
+        tmp_path = tmp.name
+
+    try:
+        result = analyze_pcap(tmp_path)
+    except Exception as e:
+        try:
+            os.unlink(tmp_path)
+        except FileNotFoundError:
+            pass
+        return HTMLResponse(f"<h3>Analysis error</h3><pre>{e}</pre>", status_code=500)
+
+    try:
+        os.unlink(tmp_path)
+    except FileNotFoundError:
+        pass
+
+    # Render results
+    rows = []
+    for s in result["streams"]:
+        rows.append(
+            f"<tr>"
+            f"<td><code>{s['group']}</code></td>"
+            f"<td>{s['port']}</td>"
+            f"<td>{s['packets']}</td>"
+            f"<td>{s['bytes']}</td>"
+            f"<td>{(s['pps'] or 0):.2f}</td>"
+            f"<td>{((s['bps'] or 0)/1e6):.2f}</td>"
+            f"<td>{(s['jitter'] or 0):.6f}</td>"
+            f"<td><code>{s['ttl_hist']}</code></td>"
+            f"</tr>"
+        )
+
+    rtp_rows = []
+    for r in result["rtp"]:
+        rtp_rows.append(
+            f"<tr>"
+            f"<td><code>{r['group']}</code></td>"
+            f"<td>{r['port']}</td>"
+            f"<td>{r['ssrc']}</td>"
+            f"<td>{r['pt']}</td>"
+            f"<td>{r['packets']}</td>"
+            f"<td>{r['lost']}</td>"
+            f"<td>{r['loss_pct']:.3f}</td>"
+            f"</tr>"
+        )
+
+    vlan_rows = []
+    for vid, cnt in result["vlan_ids"]:
+        vlan_rows.append(f"<tr><td>{vid}</td><td>{cnt}</td></tr>")
+
+    warnings_html = ""
+    if result["warnings"]:
+        lis = "".join([f"<li>{w}</li>" for w in result["warnings"]])
+        warnings_html = f"<div class='card warn'><strong>Findings</strong><ul>{lis}</ul></div>"
+
+    html = f"""
+<!doctype html>
+<html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'>
+<title>{APP_TITLE}</title>
+<link rel=preconnect href=https://fonts.googleapis.com>
+<link rel=preconnect href=https://fonts.gstatic.com crossorigin>
+<link href='https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap' rel=stylesheet>
+<style>{BASE_CSS}</style>
+</head>
+<body>
+<header><h1 style='margin:0;font-size:20px'>{APP_TITLE}</h1></header>
+<main>
+  {warnings_html}
+  <div class='grid'>
+    <div class=card>
+      <h3>Capture Summary</h3>
+      <p class=muted>Packets: <strong>{result['summary']['total_packets']}</strong><br>
+      Duration: <strong>{(result['summary']['duration_seconds'] or 0):.3f} s</strong></p>
+      <p class=muted>First TS: {result['summary']['first_timestamp']}<br>Last TS: {result['summary']['last_timestamp']}</p>
+      <p class=muted>mDNS: {result['mdns_packets']} | SSDP: {result['ssdp_packets']}</p>
+    </div>
+    <div class=card>
+      <h3>IGMP</h3>
+      <p>Type counts: <code>{result['igmp']['type_counts']}</code></p>
+      <p>Queries: <span class=pill>{result['igmp']['queries']}</span></p>
+      <details><summary>Reported groups</summary><pre>{result['igmp']['groups_reported']}</pre></details>
+      <details><summary>Left groups</summary><pre>{result['igmp']['groups_left']}</pre></details>
+    </div>
+    <div class=card>
+      <h3>VLAN IDs (802.1Q)</h3>
+      {('<table><thead><tr><th>VLAN</th><th>Frames</th></tr></thead><tbody>' + ''.join(vlan_rows) + '</tbody></table>') if vlan_rows else '<p class=muted>No VLAN tags observed.</p>'}
+    </div>
+  </div>
+
+  <div class=card>
+    <h3>Multicast Streams</h3>
+    {('<table><thead><tr><th>Group</th><th>Port</th><th>Packets</th><th>Bytes</th><th>PPS</th><th>Bitrate (Mbps)</th><th>Jitter (s)</th><th>TTL Histogram</th></tr></thead><tbody>' + ''.join(rows) + '</tbody></table>') if rows else '<p class=muted>No multicast UDP streams observed.</p>'}
+  </div>
+
+  <div class=card>
+    <h3>RTP (if detected)</h3>
+    {('<table><thead><tr><th>Group</th><th>Port</th><th>SSRC</th><th>PT</th><th>Packets</th><th>Lost</th><th>Loss %</th></tr></thead><tbody>' + ''.join(rtp_rows) + '</tbody></table>') if rtp_rows else '<p class=muted>No RTP streams confidently identified.</p>'}
+  </div>
+
+  <div class=card>
+    <a class=btn href='/'>Analyze another file</a>
+  </div>
+
+  <div class='footer muted'>Processed in {result['elapsed_sec']:.2f}s • File: {name}</div>
+</main>
+</body></html>
+"""
+    return HTMLResponse(html)
+
+
+REQUIREMENTS_TXT = """
+fastapi>=0.111.0
+uvicorn[standard]>=0.30.0
+scapy>=2.5.0
+jinja2>=3.1.0
+""".strip()
+
+# Optional helper to emit a requirements.txt next to the app for convenience
+@app.get("/requirements.txt", response_class=PlainTextResponse)
+async def requirements_txt():
+    return REQUIREMENTS_TXT
+
+
+if __name__ == "__main__":
+    # Handy for `python app.py` during dev; in prod, prefer `uvicorn app:app -w 2 --proxy-headers` behind nginx
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
